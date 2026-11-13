@@ -885,7 +885,7 @@ Windows at once. The run-wide timeout does not stop the processes of
 
 ### `lock`
 
-- **Type**: `boolean | string | string[]`
+- **Type**: `boolean | string | { name, slots } | (string | { name, slots })[]`
 - **Default**: unset
 
 Resources the task holds while its commands run. A run that needs a lock
@@ -905,6 +905,10 @@ lock = ["ios-simulator", "test-db"]
 [tasks.migrate]
 run = "./scripts/migrate.sh"
 lock = true
+
+[tasks."test:ios"]
+run = "xcodebuild test -scheme App"
+lock = { name = "xcode", slots = 2 }
 ```
 
 - A name is shared by every task on this machine that names it, in any project.
@@ -913,6 +917,11 @@ lock = true
   is shared only by tasks of that project, not by every project on the machine.
 - `true` lets one run of the task at a time across every worktree of its
   repository. Another repository with a task of the same name is not affected.
+- `{ name = "...", slots = N }` lets up to N runs hold the named lock at once,
+  for a resource that is limited rather than unique, such as memory or CPU for
+  heavy builds. Give it the same `slots` in every task that names it: a task
+  takes any free one of the lock's first N slots, and a plain name takes only
+  the first, so tasks that disagree are limited by the largest `slots`.
 - `false` or an empty list takes no lock, for example to turn off a lock a
   template sets.
 
@@ -927,6 +936,7 @@ lock:
 ```text
 [test] waiting for lock test-db, held by test in ~/src/shop-pr-42 (pid 4121, for 2m10s)
 [test] got lock test-db after 3m02s
+[test:ios] waiting for lock xcode (2 slots), held by test:ios in ~/src/app-pr-7 (pid 5120, for 4m01s), build in ~/src/app-pr-9 (pid 5302, for 40s)
 ```
 
 A task holds its locks, its `--jobs` slot and its share of the terminal

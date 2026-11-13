@@ -7,8 +7,12 @@
 //! holder dies and nothing ever goes stale. Lock files are never deleted: a waiter that had
 //! opened a removed file would lock it while a newcomer locked its replacement.
 //!
-//! The holder writes who it is beside the lock, for the message a waiter prints. A record
-//! whose lock can be taken is left over and is never shown.
+//! `lock = { name, slots = N }` lets up to N runs hold a named lock at once: it has one file
+//! for each slot, and a run takes whichever of its first N is free. The first slot's file is
+//! the one a plain `lock = "name"` takes, so a run without slots only ever shares the first.
+//!
+//! The holder writes who it is beside the slot it holds, for the message a waiter prints. A
+//! record whose slot can be taken is left over and is never shown.
 //!
 //! Locks are taken in sorted order, so two runs never each hold a lock the other wants. A task
 //! exports what it holds in `MISE_TASK_LOCKS`, and a task that inherits a lock there, from a
@@ -16,6 +20,7 @@
 //! waiting on its own parent.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dirs;
 use crate::file::display_path;
-use crate::task::{Task, TaskLock};
+use crate::task::{NamedLock, Task, TaskLock};
 
 /// The locks a task's commands run under, comma-separated.
 pub(crate) const LOCKS_ENV: &str = "MISE_TASK_LOCKS";
@@ -41,6 +46,8 @@ pub(crate) struct LockKey {
     id: String,
     /// What messages call it.
     display: String,
+    /// How many runs may hold it at once.
+    slots: NonZeroU32,
 }
 
 impl LockKey {
@@ -48,10 +55,11 @@ impl LockKey {
         &self.id
     }
 
-    fn named(name: &str) -> Self {
+    fn named(lock: &NamedLock) -> Self {
         Self {
-            id: name.to_string(),
-            display: name.to_string(),
+            id: lock.name.clone(),
+            display: lock.name.clone(),
+            slots: lock.slots,
         }
     }
 
@@ -75,12 +83,26 @@ impl LockKey {
         Self {
             id,
             display: format!("{} (this repository)", task.name),
+            slots: NonZeroU32::MIN,
         }
     }
 
-    fn path(&self, ext: &str) -> PathBuf {
+    /// The file for one of the lock's slots. The first slot keeps the name a lock without
+    /// slots has, so the two share it.
+    fn path(&self, slot: u32, ext: &str) -> PathBuf {
         let file = &mise_util::hash::hash_sha256_to_str(&self.id)[..16];
-        locks_dir().join(format!("{file}.{ext}"))
+        match slot {
+            0 => locks_dir().join(format!("{file}.{ext}")),
+            _ => locks_dir().join(format!("{file}.{slot}.{ext}")),
+        }
+    }
+
+    /// The lock's name, and how many runs may hold it when that is more than one.
+    fn described(&self) -> String {
+        match self.slots.get() {
+            1 => self.display.clone(),
+            n => format!("{} ({n} slots)", self.display),
+        }
     }
 }
 
@@ -118,10 +140,11 @@ pub(crate) fn requested(task: &Task) -> Vec<LockKey> {
     let mut keys = match &task.lock {
         None | Some(TaskLock::Off) => vec![],
         Some(TaskLock::Task) => vec![LockKey::this_task(task)],
-        Some(TaskLock::Names(names)) => names.iter().map(|n| LockKey::named(n)).collect(),
+        Some(TaskLock::Names(names)) => names.iter().map(LockKey::named).collect(),
     };
     keys.sort();
-    keys.dedup();
+    // A name listed twice is one lock; sorting put the entry with the fewest slots first.
+    keys.dedup_by(|later, earlier| later.id == earlier.id);
     keys
 }
 
@@ -130,7 +153,7 @@ pub fn describe(task: &Task) -> Option<String> {
     let keys = requested(task);
     (!keys.is_empty()).then(|| {
         keys.iter()
-            .map(|k| k.display.as_str())
+            .map(LockKey::described)
             .collect::<Vec<_>>()
             .join(", ")
     })
@@ -200,6 +223,11 @@ struct HolderRecord {
 }
 
 impl HolderRecord {
+    fn read(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
     fn describe(&self) -> String {
         let since = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -208,19 +236,26 @@ impl HolderRecord {
         let since = human(since);
         match &self.root {
             Some(root) => format!(
-                "held by {} in {} (pid {}, for {since})",
+                "{} in {} (pid {}, for {since})",
                 self.task,
                 display_path(root),
                 self.pid
             ),
-            None => format!("held by {} (pid {}, for {since})", self.task, self.pid),
+            None => format!("{} (pid {}, for {since})", self.task, self.pid),
         }
     }
 }
 
+/// One slot of a lock, held.
+struct HeldSlot {
+    key: LockKey,
+    slot: u32,
+    _file: fslock::LockFile,
+}
+
 /// Locks this task holds. Dropping it removes the holder records, then releases the locks.
 pub(crate) struct HeldLocks {
-    locks: Vec<(LockKey, fslock::LockFile)>,
+    locks: Vec<HeldSlot>,
 }
 
 impl HeldLocks {
@@ -233,8 +268,8 @@ impl HeldLocks {
 impl Drop for HeldLocks {
     fn drop(&mut self) {
         // The record goes first, while the lock still keeps the next holder from writing its own.
-        for (key, _) in &self.locks {
-            let _ = std::fs::remove_file(key.path("json"));
+        for held in &self.locks {
+            let _ = std::fs::remove_file(held.key.path(held.slot, "json"));
         }
     }
 }
@@ -243,8 +278,8 @@ impl Drop for HeldLocks {
 pub(crate) struct LockAcquisition<'a> {
     task: &'a Task,
     pending: std::vec::IntoIter<LockKey>,
-    /// The lock this acquisition is waiting for, already opened.
-    current: Option<(LockKey, fslock::LockFile)>,
+    /// The lock this acquisition is waiting for, each of its slots already opened.
+    current: Option<(LockKey, Vec<fslock::LockFile>)>,
     held: HeldLocks,
 }
 
@@ -262,48 +297,69 @@ impl<'a> LockAcquisition<'a> {
     }
 
     /// Takes every lock that is free, in order, and stops at the first one that is not.
-    /// `true` once every lock is held.
+    /// A lock is free when any of its slots is. `true` once every lock is held.
     pub(crate) fn try_take(&mut self) -> Result<bool> {
         loop {
-            let (key, mut file) = match self.current.take() {
+            let (key, mut files) = match self.current.take() {
                 Some(current) => current,
                 None => match self.pending.next() {
                     Some(key) => {
-                        let path = key.path("lock");
-                        let file = fslock::LockFile::open(&path).wrap_err_with(|| {
-                            format!(
-                                "task {}: cannot open lock file {}",
-                                self.task.name,
-                                path.display()
-                            )
-                        })?;
-                        (key, file)
+                        let files = (0..key.slots.get())
+                            .map(|slot| {
+                                let path = key.path(slot, "lock");
+                                fslock::LockFile::open(&path).wrap_err_with(|| {
+                                    format!(
+                                        "task {}: cannot open lock file {}",
+                                        self.task.name,
+                                        path.display()
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        (key, files)
                     }
                     None => return Ok(true),
                 },
             };
-            if !file.try_lock().wrap_err_with(|| {
-                format!("task {}: cannot take lock {}", self.task.name, key.display)
-            })? {
-                self.current = Some((key, file));
-                return Ok(false);
+            let mut taken = None;
+            for (slot, file) in files.iter_mut().enumerate() {
+                if file.try_lock().wrap_err_with(|| {
+                    format!("task {}: cannot take lock {}", self.task.name, key.display)
+                })? {
+                    taken = Some(slot);
+                    break;
+                }
             }
-            self.write_record(&key);
-            self.held.locks.push((key, file));
+            let Some(slot) = taken else {
+                self.current = Some((key, files));
+                return Ok(false);
+            };
+            // Closing the other slots' files keeps nothing: this run never locked them.
+            let file = files.swap_remove(slot);
+            let slot = slot as u32;
+            self.write_record(&key, slot);
+            self.held.locks.push(HeldSlot {
+                key,
+                slot,
+                _file: file,
+            });
         }
     }
 
-    /// The lock this acquisition waits for and who holds it, if the holder said.
+    /// The lock this acquisition waits for and who holds it, as far as the holders said.
     pub(crate) fn waiting_for(&self) -> String {
         let Some((key, _)) = &self.current else {
             return String::new();
         };
-        let holder = std::fs::read_to_string(key.path("json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<HolderRecord>(&text).ok())
-            .map(|record| format!(", {}", record.describe()))
-            .unwrap_or_default();
-        format!("lock {}{holder}", key.display)
+        let holders = (0..key.slots.get())
+            .filter_map(|slot| HolderRecord::read(&key.path(slot, "json")))
+            .map(|record| record.describe())
+            .collect::<Vec<_>>();
+        let holders = match holders.is_empty() {
+            true => String::new(),
+            false => format!(", held by {}", holders.join(", ")),
+        };
+        format!("lock {}{holders}", key.described())
     }
 
     /// Waits until every lock is held. `waited` is the time this task already spent waiting
@@ -362,7 +418,7 @@ impl<'a> LockAcquisition<'a> {
             .held
             .locks
             .iter()
-            .map(|(k, _)| k.display.as_str())
+            .map(|held| held.key.display.as_str())
             .collect::<Vec<_>>();
         format!(
             "{} {}",
@@ -371,7 +427,7 @@ impl<'a> LockAcquisition<'a> {
         )
     }
 
-    fn write_record(&self, key: &LockKey) {
+    fn write_record(&self, key: &LockKey, slot: u32) {
         let record = HolderRecord {
             pid: std::process::id(),
             task: self.task.name.clone(),
@@ -383,7 +439,7 @@ impl<'a> LockAcquisition<'a> {
         };
         // Only for the message other runs print, so a failure here changes nothing else.
         if let Ok(json) = serde_json::to_string(&record)
-            && let Err(err) = crate::file::write(key.path("json"), json)
+            && let Err(err) = crate::file::write(key.path(slot, "json"), json)
         {
             debug!("task {}: cannot record lock holder: {err}", self.task.name);
         }
@@ -393,6 +449,21 @@ impl<'a> LockAcquisition<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(name: &str) -> LockKey {
+        LockKey::named(&NamedLock::new(name))
+    }
+
+    fn slotted(name: &str, slots: u32) -> LockKey {
+        LockKey::named(&NamedLock::new(name).with_slots(NonZeroU32::new(slots).unwrap()))
+    }
+
+    fn task(name: &str) -> Task {
+        Task {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
 
     fn worktree(main: &Path, name: &str) -> PathBuf {
         let private = main.join(".git").join("worktrees").join(name);
@@ -433,10 +504,10 @@ mod tests {
             ..Default::default()
         };
         let held: BTreeSet<String> = ["b".to_string()].into();
-        assert!(check_nested_order(&task, &held, &[LockKey::named("c")]).is_ok());
-        assert!(check_nested_order(&task, &BTreeSet::new(), &[LockKey::named("a")]).is_ok());
+        assert!(check_nested_order(&task, &held, &[named("c")]).is_ok());
+        assert!(check_nested_order(&task, &BTreeSet::new(), &[named("a")]).is_ok());
         assert!(check_nested_order(&task, &held, &[]).is_ok());
-        let err = check_nested_order(&task, &held, &[LockKey::named("a")]).unwrap_err();
+        let err = check_nested_order(&task, &held, &[named("a")]).unwrap_err();
         assert!(
             err.to_string()
                 .contains("cannot take lock a while a parent task holds b"),
@@ -450,9 +521,9 @@ mod tests {
             name: "retry".into(),
             ..Default::default()
         };
-        let key = LockKey::named(&format!("budget-{}", std::process::id()));
+        let key = named(&format!("budget-{}", std::process::id()));
         std::fs::create_dir_all(locks_dir()).unwrap();
-        let mut holder = fslock::LockFile::open(&key.path("lock")).unwrap();
+        let mut holder = fslock::LockFile::open(&key.path(0, "lock")).unwrap();
         assert!(holder.try_lock().unwrap());
 
         let mut acquisition = LockAcquisition::new(&task, vec![key]).unwrap();
@@ -470,7 +541,7 @@ mod tests {
 
         // Once the lock is free, the wait adds its own time to what the task spent before.
         drop(holder);
-        let key = LockKey::named(&format!("budget-{}", std::process::id()));
+        let key = named(&format!("budget-{}", std::process::id()));
         let acquisition = LockAcquisition::new(&task, vec![key]).unwrap();
         let mut waited = Duration::from_secs(2);
         let held = acquisition
@@ -495,7 +566,7 @@ mod tests {
 
     #[test]
     fn inherited_locks_round_trip_through_the_env() {
-        let keys = vec![LockKey::named("b"), LockKey::named("a")];
+        let keys = vec![named("b"), named("a")];
         let parent: BTreeSet<String> = ["c".to_string()].into();
         let value = exported(&parent, &keys);
         assert_eq!(value, "a,b,c");
@@ -505,5 +576,65 @@ mod tests {
             ["a", "b", "c"].map(String::from).into_iter().collect()
         );
         assert!(inherited(&BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_lock_with_slots_admits_that_many_runs() {
+        let name = format!("slots-{}", std::process::id());
+        let (a, b, c) = (task("a"), task("b"), task("c"));
+
+        let mut first = LockAcquisition::new(&a, vec![slotted(&name, 2)]).unwrap();
+        assert!(first.try_take().unwrap());
+        let first = first.into_held();
+        let mut second = LockAcquisition::new(&b, vec![slotted(&name, 2)]).unwrap();
+        assert!(second.try_take().unwrap());
+        let second = second.into_held();
+
+        let mut third = LockAcquisition::new(&c, vec![slotted(&name, 2)]).unwrap();
+        assert!(!third.try_take().unwrap());
+        let waiting = third.waiting_for();
+        assert!(
+            waiting.starts_with(&format!("lock {name} (2 slots), held by a (pid ")),
+            "{waiting}"
+        );
+        assert!(waiting.contains(", b (pid "), "{waiting}");
+
+        // Whichever run ends, its slot is the one the waiter takes.
+        drop(first);
+        assert!(third.try_take().unwrap());
+        drop(third.into_held());
+        drop(second);
+    }
+
+    #[test]
+    fn a_lock_without_slots_shares_the_first_slot() {
+        let name = format!("first-slot-{}", std::process::id());
+        let (a, b) = (task("a"), task("b"));
+
+        let mut slotted_run = LockAcquisition::new(&a, vec![slotted(&name, 2)]).unwrap();
+        assert!(slotted_run.try_take().unwrap());
+        let slotted_run = slotted_run.into_held();
+        let mut plain = LockAcquisition::new(&b, vec![named(&name)]).unwrap();
+        assert!(!plain.try_take().unwrap());
+        assert!(
+            plain
+                .waiting_for()
+                .starts_with(&format!("lock {name}, held by a"))
+        );
+        drop(slotted_run);
+        assert!(plain.try_take().unwrap());
+        drop(plain.into_held());
+    }
+
+    #[test]
+    fn a_name_listed_twice_is_one_lock() {
+        let mut t = task("t");
+        t.lock = Some(TaskLock::Names(vec![
+            NamedLock::new("xcode").with_slots(NonZeroU32::new(3).unwrap()),
+            NamedLock::new("sim"),
+            NamedLock::new("xcode").with_slots(NonZeroU32::new(2).unwrap()),
+        ]));
+        assert_eq!(requested(&t), vec![named("sim"), slotted("xcode", 2)]);
+        assert_eq!(describe(&t).unwrap(), "sim, xcode (2 slots)");
     }
 }

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# `lock = { name, slots = N }` lets up to N runs hold a lock at once, across
+# separate `mise run` processes and inside one.
+
+export LOCK_LOG="$PWD/running.log"
+export LOCK_SIGNALS="$PWD/signals"
+mkdir -p "$LOCK_SIGNALS" a b c
+
+cat <<'EOF' >a/mise.toml
+[tasks.hold]
+lock = { name = "heavy", slots = 2 }
+run = '''
+touch "$LOCK_SIGNALS/held-$HOLD_ID"
+i=0; while [ ! -f "$LOCK_SIGNALS/release" ]; do i=$((i + 1)); [ "$i" -lt 600 ] || exit 1; sleep 0.1; done
+'''
+EOF
+cp a/mise.toml b/mise.toml
+
+cat <<'EOF' >c/mise.toml
+[tasks.wait]
+lock = { name = "heavy", slots = 2 }
+run = "echo wait ran"
+
+[tasks.plain]
+lock = "heavy"
+run = "echo plain ran"
+
+[tasks.outer]
+lock = { name = "heavy", slots = 2 }
+run = "mise run --lock-timeout 10s inner"
+
+[tasks.inner]
+lock = { name = "heavy", slots = 2 }
+run = 'echo "inner sees $MISE_TASK_LOCKS"'
+
+[tasks.w1]
+lock = { name = "pool", slots = 2 }
+run = 'mkdir "$LOCK_SIGNALS/w1"; ls "$LOCK_SIGNALS" | grep -c "^w" >>"$LOCK_LOG"; sleep 1; rmdir "$LOCK_SIGNALS/w1"'
+
+[tasks.w2]
+lock = { name = "pool", slots = 2 }
+run = 'mkdir "$LOCK_SIGNALS/w2"; ls "$LOCK_SIGNALS" | grep -c "^w" >>"$LOCK_LOG"; sleep 1; rmdir "$LOCK_SIGNALS/w2"'
+
+[tasks.w3]
+lock = { name = "pool", slots = 2 }
+run = 'mkdir "$LOCK_SIGNALS/w3"; ls "$LOCK_SIGNALS" | grep -c "^w" >>"$LOCK_LOG"; sleep 1; rmdir "$LOCK_SIGNALS/w3"'
+EOF
+
+assert_contains "cd c && timeout 30 mise tasks info wait" "heavy (2 slots)"
+
+# A table's name renders templates as a plain name does.
+mkdir -p tpl
+cat <<'EOF' >tpl/mise.toml
+[tasks.w]
+lock = { name = "heavy-{{ config_root | hash(len=8) }}", slots = 2 }
+run = "true"
+EOF
+assert_matches "mise --cd tpl tasks info w" 'Lock: +heavy-[[:alnum:]]{8} \(2 slots\)'
+
+(cd a && HOLD_ID=a mise run hold) >a.log 2>&1 &
+a_pid=$!
+wait_for_file "$LOCK_SIGNALS/held-a" "hold in a" 30 "$a_pid"
+
+# One slot is still free.
+assert_contains "cd c && timeout 30 mise run --lock-timeout 1s wait 2>&1" "wait ran"
+
+(cd b && HOLD_ID=b mise run hold) >b.log 2>&1 &
+b_pid=$!
+wait_for_file "$LOCK_SIGNALS/held-b" "hold in b" 30 "$b_pid"
+
+# Both slots are taken, and the waiter names both holders.
+assert_fail_contains "cd c && timeout 30 mise run --lock-timeout 1s wait" \
+  "waiting for lock heavy (2 slots), held by hold in ~/workdir/"
+assert_fail_contains "cd c && timeout 30 mise run --lock-timeout 1s wait" ", hold in ~/workdir/"
+# A plain name takes the first slot, which one of them holds.
+assert_fail_contains "cd c && timeout 30 mise run --lock-timeout 1s plain" \
+  "waiting for lock heavy, held by hold in"
+
+touch "$LOCK_SIGNALS/release"
+wait "$a_pid"
+wait "$b_pid"
+
+# A task started under a slotted lock already holds it.
+assert_contains "cd c && timeout 30 mise run outer 2>&1" "inner sees heavy"
+
+# Inside one run, at most two of the three tasks hold the pool at once.
+(cd c && timeout 60 mise run --jobs 3 w1 ::: w2 ::: w3)
+assert "sort -n '$LOCK_LOG' | tail -n 1" "2"

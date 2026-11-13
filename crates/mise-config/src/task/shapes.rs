@@ -51,16 +51,38 @@ pub struct TaskTagName(pub String);
 pub enum TaskLockDecl {
     /// `true` lets one run of this task at a time across every worktree of its repository; `false` takes no lock
     Task(bool),
-    /// a lock name shared by every task on this machine that names it
-    One(TaskLockName),
-    /// lock names shared by every task on this machine that names them, taken in sorted order
-    Many(Vec<TaskLockName>),
+    /// a lock shared by every task on this machine that names it
+    One(TaskLockEntry),
+    /// locks shared by every task on this machine that names them, taken in sorted order
+    Many(Vec<TaskLockEntry>),
+}
+
+/// a lock shared by every task on this machine that names it
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[schemars(transform = crate::schema::one_of)]
+pub enum TaskLockEntry {
+    /// a lock name shared by every task on this machine that names it; one run holds it at a time
+    Name(TaskLockName),
+    /// a lock shared by every task on this machine that names it, which up to `slots` runs hold at once
+    Table(TaskLockTable),
 }
 
 /// a lock name shared by every task on this machine that names it
 #[derive(JsonSchema)]
 #[schemars(extend("pattern" = "^[^,]*\\S[^,]*$"))]
 pub struct TaskLockName(pub String);
+
+#[derive(JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(transform = crate::schema::unevaluated)]
+pub struct TaskLockTable {
+    /// a lock name shared by every task on this machine that names it
+    pub name: TaskLockName,
+    /// how many runs may hold the lock at once; tasks that name the lock should agree on it
+    #[schemars(range(min = 1))]
+    pub slots: Option<u32>,
+}
 
 /// prompt to answer before this task's own command runs, after its dependencies
 #[derive(JsonSchema)]

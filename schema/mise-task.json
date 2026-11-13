@@ -529,17 +529,63 @@
               "description": "`true` lets one run of this task at a time across every worktree of its repository; `false` takes no lock"
             },
             {
-              "type": "string",
-              "description": "a lock name shared by every task on this machine that names it",
-              "pattern": "^[^,]*\\S[^,]*$"
+              "description": "a lock shared by every task on this machine that names it",
+              "oneOf": [
+                {
+                  "type": "string",
+                  "description": "a lock name shared by every task on this machine that names it; one run holds it at a time",
+                  "pattern": "^[^,]*\\S[^,]*$"
+                },
+                {
+                  "type": "object",
+                  "description": "a lock shared by every task on this machine that names it, which up to `slots` runs hold at once",
+                  "required": ["name"],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "a lock name shared by every task on this machine that names it",
+                      "pattern": "^[^,]*\\S[^,]*$"
+                    },
+                    "slots": {
+                      "type": "integer",
+                      "description": "how many runs may hold the lock at once; tasks that name the lock should agree on it",
+                      "minimum": 1
+                    }
+                  },
+                  "unevaluatedProperties": false
+                }
+              ]
             },
             {
               "type": "array",
-              "description": "lock names shared by every task on this machine that names them, taken in sorted order",
+              "description": "locks shared by every task on this machine that names them, taken in sorted order",
               "items": {
-                "type": "string",
-                "description": "a lock name shared by every task on this machine that names it",
-                "pattern": "^[^,]*\\S[^,]*$"
+                "description": "a lock shared by every task on this machine that names it",
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "description": "a lock name shared by every task on this machine that names it; one run holds it at a time",
+                    "pattern": "^[^,]*\\S[^,]*$"
+                  },
+                  {
+                    "type": "object",
+                    "description": "a lock shared by every task on this machine that names it, which up to `slots` runs hold at once",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "description": "a lock name shared by every task on this machine that names it",
+                        "pattern": "^[^,]*\\S[^,]*$"
+                      },
+                      "slots": {
+                        "type": "integer",
+                        "description": "how many runs may hold the lock at once; tasks that name the lock should agree on it",
+                        "minimum": 1
+                      }
+                    },
+                    "required": ["name"],
+                    "unevaluatedProperties": false
+                  }
+                ]
               }
             }
           ]
